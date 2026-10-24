@@ -644,7 +644,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <!-- ============ Firebase 完全版モジュール（アップロード緩和） ============ -->
+  <!-- ============ Firebase 完全版モジュール（修正済み） ============ -->
   <!-- ============================================================ -->
   <script type="module">
     // ===== Firebase SDK（すべて同じバージョンに統一） =====
@@ -699,12 +699,11 @@
 
     const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1550795111246336062/c-mghw5IuTGYVVsw-xJ5ahbIs-VhZV5d7TOsbq7HWeI6nP2Rr0U__8DHZueFyDt0CZvj";
 
-    // ===== アップロード上限（大幅緩和） =====
-    const IMAGE_MAX_WIDTH = 2560;              // 画像リサイズ時の最大長辺
-    const IMAGE_QUALITY = 0.85;
-    const IMAGE_MAX_BASE64_SIZE = 500 * 1024;  // base64 フォールバック時の上限
-    const GIF_MAX_BASE64_SIZE   = 800 * 1024;  // base64 フォールバック時の上限
-    const MEDIA_MAX_BYTES = 100 * 1024 * 1024; // Storage アップロード上限（100MB）
+    const IMAGE_MAX_WIDTH = 1280;
+    const IMAGE_QUALITY = 0.75;
+    const IMAGE_MAX_BASE64_SIZE = 500 * 1024;
+    const GIF_MAX_BASE64_SIZE   = 800 * 1024;
+    const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 
     // ===== Discord 通知 =====
     async function sendDiscordApprovalNotification(email, displayName, uid, fingerprint) {
@@ -1254,7 +1253,7 @@
       return false;
     }
 
-    // ===== ファイル種別判定 =====
+    // ===== ファイル処理 =====
     function getFileKind(file) {
       if (!file) return null;
       const t = (file.type || "").toLowerCase();
@@ -1265,8 +1264,6 @@
       if (t.startsWith("audio/")) return "audio";
       return null;
     }
-
-    // ===== base64 フォールバック用（Storage失敗時のみ） =====
     function fileToBase64Image(file) {
       return new Promise((resolve, reject) => {
         if (!file) { resolve(null); return; }
@@ -1289,7 +1286,7 @@
               quality -= 0.1;
               dataUrl = canvas.toDataURL('image/jpeg', quality);
             }
-            if (dataUrl.length > IMAGE_MAX_BASE64_SIZE) { reject(new Error('画像が大きすぎます。')); return; }
+            if (dataUrl.length > IMAGE_MAX_BASE64_SIZE) { reject(new Error('画像が大きすぎます。別の画像を選んでください。')); return; }
             resolve({ kind: 'image', dataUrl, name: file.name, type: 'image/jpeg', width, height, size: dataUrl.length });
           };
           img.src = e.target.result;
@@ -1308,13 +1305,9 @@
         reader.readAsDataURL(file);
       });
     }
-
-    // ===== Storage アップロード =====
     async function uploadMediaToStorage(file) {
       if (!currentUser) throw new Error("ログインが必要です");
-      if (file.size > MEDIA_MAX_BYTES) {
-        throw new Error(`ファイルが大きすぎます（上限 ${MEDIA_MAX_BYTES / 1024 / 1024}MB）`);
-      }
+      if (file.size > MEDIA_MAX_BYTES) throw new Error(`ファイルが大きすぎます（上限 ${MEDIA_MAX_BYTES / 1024 / 1024}MB）`);
       const kind = getFileKind(file);
       const safeName = (file.name || "file").replace(/[^\w.\-]/g, "_");
       const path = `media/${currentUser.uid}/${Date.now()}_${safeName}`;
@@ -1323,34 +1316,21 @@
       const url = await getDownloadURL(sRef);
       return { kind, url, name: file.name, type: file.type, size: file.size, storagePath: path };
     }
-
-    // ===== 添付処理：全部 Storage に上げる（失敗時のみ base64 フォールバック） =====
     async function processAttachment(file) {
       if (!file) return null;
       const kind = getFileKind(file);
       if (!kind) throw new Error("対応していないファイル形式です（画像・GIF・音声・動画のみ）");
-      if (file.size > MEDIA_MAX_BYTES) {
-        throw new Error(`ファイルが大きすぎます（上限 ${MEDIA_MAX_BYTES / 1024 / 1024}MB）`);
+      if (kind === "gif") {
+        const r = await fileToBase64Raw(file);
+        if (r.size > GIF_MAX_BASE64_SIZE) throw new Error("GIFが大きすぎます（上限 800KB 程度）。");
+        return { kind: "gif", dataUrl: r.dataUrl, name: r.name, type: r.type, size: r.size };
       }
-      try {
-        return await uploadMediaToStorage(file);
-      } catch (err) {
-        console.warn("Storage アップロード失敗、base64 フォールバック:", err.message);
-        if (kind === "gif") {
-          const r = await fileToBase64Raw(file);
-          if (r.size > GIF_MAX_BASE64_SIZE) {
-            throw new Error("Storage へのアップロードに失敗し、GIFも大きすぎます。");
-          }
-          return { kind: "gif", dataUrl: r.dataUrl, name: r.name, type: r.type, size: r.size };
-        }
-        if (kind === "image") {
-          const r = await fileToBase64Image(file);
-          return { kind: "image", dataUrl: r.dataUrl, name: r.name, type: r.type, width: r.width, height: r.height, size: r.size };
-        }
-        throw err;
+      if (kind === "image") {
+        const r = await fileToBase64Image(file);
+        return { kind: "image", dataUrl: r.dataUrl, name: r.name, type: r.type, width: r.width, height: r.height, size: r.size };
       }
+      return await uploadMediaToStorage(file);
     }
-
     async function deleteStorageFileIfAny(file) {
       if (!file || !file.storagePath) return;
       try { await deleteObject(storageRef(storage, file.storagePath)); } catch (e) { console.warn("Storage削除スキップ:", e.message); }
@@ -1361,49 +1341,37 @@
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
       return (bytes / 1024 / 1024).toFixed(2) + ' MB';
     }
-
-    // ===== 添付表示（URL優先） =====
     function buildFileHtml(file) {
       if (!file) return "";
+      const kind = file.kind || (file.dataUrl ? "image" : (file.url ? "video" : null));
       const name = escapeHtml(file.name || "添付ファイル");
-      const src = file.url || file.dataUrl;
-      const kind = file.kind || (file.url ? "video" : (file.dataUrl ? "image" : null));
-      if (!src) return "";
-
-      if (kind === "image" || kind === "gif") {
+      if (kind === "image" || kind === "gif" || (file.dataUrl && !file.url)) {
+        if (!file.dataUrl) return "";
         return `
           <div class="post-file">
-            <a href="${src}" target="_blank" rel="noopener noreferrer">
-              <img src="${src}" alt="${name}" loading="lazy">
+            <a href="${file.dataUrl}" target="_blank" rel="noopener noreferrer">
+              <img src="${file.dataUrl}" alt="${name}" loading="lazy">
             </a>
-            <a href="${src}" target="_blank" rel="noopener noreferrer" download="${name}">
-              📎 ${name}（${formatSize(file.size)}）
-            </a>
+            <a href="${file.dataUrl}" download="${name}">📎 ${name}（${formatSize(file.size)}）</a>
           </div>`;
       }
-      if (kind === "video") {
+      if (kind === "video" && file.url) {
         return `
           <div class="post-file">
-            <video controls preload="metadata" playsinline src="${src}"
+            <video controls preload="metadata" playsinline src="${file.url}"
               style="max-width:100%;max-height:360px;border-radius:6px;border:1px solid #e5e7eb;display:block;margin-bottom:4px;"></video>
-            <a href="${src}" target="_blank" rel="noopener noreferrer" download="${name}">
-              🎬 ${name}（${formatSize(file.size)}）
-            </a>
+            <a href="${file.url}" target="_blank" rel="noopener noreferrer" download="${name}">🎬 ${name}（${formatSize(file.size)}）</a>
           </div>`;
       }
-      if (kind === "audio") {
+      if (kind === "audio" && file.url) {
         return `
           <div class="post-file">
-            <audio controls preload="metadata" src="${src}" style="width:100%;margin-bottom:4px;"></audio>
-            <a href="${src}" target="_blank" rel="noopener noreferrer" download="${name}">
-              🎧 ${name}（${formatSize(file.size)}）
-            </a>
+            <audio controls preload="metadata" src="${file.url}" style="width:100%;margin-bottom:4px;"></audio>
+            <a href="${file.url}" target="_blank" rel="noopener noreferrer" download="${name}">🎧 ${name}（${formatSize(file.size)}）</a>
           </div>`;
       }
       return "";
     }
-
-    // ===== プレビュー（アップロード前にローカルで確認） =====
     async function updatePreview(fileInput, boxId, imgId, infoId) {
       const file = fileInput.files[0];
       const box = document.getElementById(boxId);
@@ -1440,13 +1408,13 @@
           mediaSlot.appendChild(a);
           info.textContent = `${file.name}（音声, ${formatSize(file.size)}）`;
         } else if (kind === "gif") {
-          const url = URL.createObjectURL(file);
-          img.src = url; img.style.display = "block";
-          info.textContent = `${file.name}（GIF, ${formatSize(file.size)}）`;
+          const r = await fileToBase64Raw(file);
+          img.src = r.dataUrl; img.style.display = "block";
+          info.textContent = `${file.name}（GIF, ${formatSize(r.size)}）`;
         } else {
-          const url = URL.createObjectURL(file);
-          img.src = url; img.style.display = "block";
-          info.textContent = `${file.name}（画像, ${formatSize(file.size)}）`;
+          const r = await fileToBase64Image(file);
+          img.src = r.dataUrl; img.style.display = "block";
+          info.textContent = `${file.name}（${r.width}×${r.height}, ${formatSize(r.size)}）`;
         }
         box.classList.add("show");
         return true;
@@ -3300,9 +3268,12 @@
             el.style.maxWidth = '100%';
             el.style.maxHeight = '160px';
             slot.appendChild(el);
+          } else if (kind === 'gif') {
+            const r = await fileToBase64Raw(f);
+            previewImg.src = r.dataUrl; previewImg.style.display = 'block';
           } else {
-            const url = URL.createObjectURL(f);
-            previewImg.src = url; previewImg.style.display = 'block';
+            const r = await fileToBase64Image(f);
+            previewImg.src = r.dataUrl; previewImg.style.display = 'block';
           }
           previewInfo.textContent = `${f.name}（${formatSize(f.size)}）`;
           previewBox.classList.add('show');
@@ -3626,6 +3597,44 @@
     window.addEventListener('unhandledrejection', (event) => {
       console.error('未処理のPromiseエラー:', event.reason);
     });
+
+    // ===== devtools検知（動作確認中はコメントアウト推奨） =====
+    // (() => {
+    //   'use strict';
+    //   const style = document.createElement('style');
+    //   style.textContent = `@media print { html, body { display:none !important; visibility:hidden !important; } }`;
+    //   document.head.appendChild(style);
+    //   window.addEventListener('contextmenu', (e) => { e.preventDefault(); }, true);
+    //   const disableDevShortcuts = (e) => {
+    //     const meta = e.metaKey, ctrl = e.ctrlKey, alt = e.altKey, shift = e.shiftKey;
+    //     const key = e.key.toLowerCase();
+    //     if (
+    //       e.key === 'F12' || e.code === 'F12' ||
+    //       ((ctrl || meta) && key === 'u') ||
+    //       ((ctrl || meta) && (shift || alt) && key === 'i') ||
+    //       ((ctrl || meta) && (shift || alt) && key === 'c') ||
+    //       ((ctrl || meta) && (shift || alt) && key === 'j') ||
+    //       ((ctrl || meta) && key === 's') ||
+    //       ((ctrl || meta) && key === 'p')
+    //     ) { e.preventDefault(); e.stopPropagation(); return false; }
+    //   };
+    //   window.addEventListener('keydown', disableDevShortcuts, true);
+    //   window.addEventListener('keyup', disableDevShortcuts, true);
+    //   window.addEventListener('keypress', disableDevShortcuts, true);
+    //   const redirectToBlank = () => { window.location.href = 'about:blank'; };
+    //   const threshold = 160;
+    //   window.addEventListener('resize', () => {
+    //     const isOpened = (window.outerWidth - window.innerWidth > threshold) ||
+    //                      (window.outerHeight - window.innerHeight > threshold);
+    //     if (isOpened) redirectToBlank();
+    //   }, true);
+    //   setInterval(() => {
+    //     const start = performance.now();
+    //     (function () {}.constructor('debugger')());
+    //     const end = performance.now();
+    //     if (end - start > 100) redirectToBlank();
+    //   }, 100);
+    // })();
   </script>
 </body>
 </html>
