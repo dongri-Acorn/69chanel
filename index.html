@@ -638,26 +638,21 @@
         </form>
       </div>
       <div id="boardListContainer">
-        <p class="text-gray-500 text-sm"><span class="loading-spinner"></span> 掲示板を読み込み中...</p>
-      </div>
+        <p class="text-gray-500 text-sm"><span class="loading-spinner"></span> 掲示板を読み込み中...</div>
     </div>
   </div>
 
   <!-- ============================================================ -->
-  <!-- ============ Firebase 完全版モジュール（修正済み） ============ -->
+  <!-- ========= Firebase 完全版モジュール（Storage 排除版） ======== -->
   <!-- ============================================================ -->
   <script type="module">
-    // ===== Firebase SDK（すべて同じバージョンに統一） =====
+    // ===== Firebase SDK（Storage は import しない） =====
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js";
     import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-analytics.js";
     import {
       getDatabase, ref, get, set, update, remove, push,
       query, orderByChild, onValue
     } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-database.js";
-    import {
-      getStorage, ref as storageRef, uploadBytes,
-      getDownloadURL, deleteObject
-    } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-storage.js";
     import {
       getAuth, GoogleAuthProvider, signInWithPopup,
       signOut, onAuthStateChanged, setPersistence,
@@ -676,11 +671,10 @@
       measurementId: "G-R3Y25RLHZT"
     };
 
-    // ===== Firebase 初期化 =====
+    // ===== Firebase 初期化（Storage なし） =====
     const app = initializeApp(firebaseConfig);
     try { getAnalytics(app); } catch (e) { console.warn("analytics init skip:", e); }
     const db = getDatabase(app);
-    const storage = getStorage(app);
     const auth = getAuth(app);
     const provider = new GoogleAuthProvider();
 
@@ -701,9 +695,10 @@
 
     const IMAGE_MAX_WIDTH = 1280;
     const IMAGE_QUALITY = 0.75;
-    const IMAGE_MAX_BASE64_SIZE = 500 * 1024;
-    const GIF_MAX_BASE64_SIZE   = 800 * 1024;
-    const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
+    const IMAGE_MAX_BASE64_SIZE = 500 * 1024;   // 500KB
+    const GIF_MAX_BASE64_SIZE   = 800 * 1024;   // 800KB
+    const MEDIA_MAX_BYTES = 7 * 1024 * 1024;    // 7MB（RTDB 10MB制限考慮）
+    const RTDB_STRING_LIMIT = 9 * 1024 * 1024;  // 9MB（安全マージン）
 
     // ===== Discord 通知 =====
     async function sendDiscordApprovalNotification(email, displayName, uid, fingerprint) {
@@ -1253,7 +1248,7 @@
       return false;
     }
 
-    // ===== ファイル処理 =====
+    // ===== ファイル処理（Storage 不使用 / すべて Base64 で RTDB 保存） =====
     function getFileKind(file) {
       if (!file) return null;
       const t = (file.type || "").toLowerCase();
@@ -1300,21 +1295,23 @@
         reader.onerror = () => reject(new Error("ファイルの読み込みに失敗しました"));
         reader.onload = (e) => {
           const dataUrl = e.target.result;
-          resolve({ dataUrl, name: file.name, type: file.type || "image/gif", size: dataUrl.length });
+          resolve({ dataUrl, name: file.name, type: file.type || "application/octet-stream", size: file.size });
         };
         reader.readAsDataURL(file);
       });
     }
-    async function uploadMediaToStorage(file) {
+    // ★ Storage アップロードを完全廃止 → Base64 で RTDB 保存
+    async function uploadMediaAsBase64(file) {
       if (!currentUser) throw new Error("ログインが必要です");
-      if (file.size > MEDIA_MAX_BYTES) throw new Error(`ファイルが大きすぎます（上限 ${MEDIA_MAX_BYTES / 1024 / 1024}MB）`);
+      if (file.size > MEDIA_MAX_BYTES) {
+        throw new Error(`ファイルが大きすぎます（上限 ${MEDIA_MAX_BYTES / 1024 / 1024}MB）。`);
+      }
       const kind = getFileKind(file);
-      const safeName = (file.name || "file").replace(/[^\w.\-]/g, "_");
-      const path = `media/${currentUser.uid}/${Date.now()}_${safeName}`;
-      const sRef = storageRef(storage, path);
-      await uploadBytes(sRef, file, { contentType: file.type || "application/octet-stream" });
-      const url = await getDownloadURL(sRef);
-      return { kind, url, name: file.name, type: file.type, size: file.size, storagePath: path };
+      const r = await fileToBase64Raw(file);
+      if (r.dataUrl.length > RTDB_STRING_LIMIT) {
+        throw new Error("ファイルが大きすぎます（Base64 変換後のサイズ超過）。より小さいファイルを選んでください。");
+      }
+      return { kind, dataUrl: r.dataUrl, name: file.name, type: r.type, size: r.size };
     }
     async function processAttachment(file) {
       if (!file) return null;
@@ -1322,18 +1319,18 @@
       if (!kind) throw new Error("対応していないファイル形式です（画像・GIF・音声・動画のみ）");
       if (kind === "gif") {
         const r = await fileToBase64Raw(file);
-        if (r.size > GIF_MAX_BASE64_SIZE) throw new Error("GIFが大きすぎます（上限 800KB 程度）。");
+        if (r.dataUrl.length > GIF_MAX_BASE64_SIZE) throw new Error("GIFが大きすぎます（上限 800KB 程度）。");
         return { kind: "gif", dataUrl: r.dataUrl, name: r.name, type: r.type, size: r.size };
       }
       if (kind === "image") {
         const r = await fileToBase64Image(file);
         return { kind: "image", dataUrl: r.dataUrl, name: r.name, type: r.type, width: r.width, height: r.height, size: r.size };
       }
-      return await uploadMediaToStorage(file);
+      return await uploadMediaAsBase64(file);
     }
     async function deleteStorageFileIfAny(file) {
-      if (!file || !file.storagePath) return;
-      try { await deleteObject(storageRef(storage, file.storagePath)); } catch (e) { console.warn("Storage削除スキップ:", e.message); }
+      // Storage を使わないため何もしない
+      return;
     }
     function formatSize(bytes) {
       if (!bytes) return '';
@@ -1343,10 +1340,9 @@
     }
     function buildFileHtml(file) {
       if (!file) return "";
-      const kind = file.kind || (file.dataUrl ? "image" : (file.url ? "video" : null));
+      const kind = file.kind || (file.dataUrl ? "image" : null);
       const name = escapeHtml(file.name || "添付ファイル");
-      if (kind === "image" || kind === "gif" || (file.dataUrl && !file.url)) {
-        if (!file.dataUrl) return "";
+      if ((kind === "image" || kind === "gif") && file.dataUrl) {
         return `
           <div class="post-file">
             <a href="${file.dataUrl}" target="_blank" rel="noopener noreferrer">
@@ -1355,19 +1351,19 @@
             <a href="${file.dataUrl}" download="${name}">📎 ${name}（${formatSize(file.size)}）</a>
           </div>`;
       }
-      if (kind === "video" && file.url) {
+      if (kind === "video" && file.dataUrl) {
         return `
           <div class="post-file">
-            <video controls preload="metadata" playsinline src="${file.url}"
+            <video controls preload="metadata" playsinline src="${file.dataUrl}"
               style="max-width:100%;max-height:360px;border-radius:6px;border:1px solid #e5e7eb;display:block;margin-bottom:4px;"></video>
-            <a href="${file.url}" target="_blank" rel="noopener noreferrer" download="${name}">🎬 ${name}（${formatSize(file.size)}）</a>
+            <a href="${file.dataUrl}" target="_blank" rel="noopener noreferrer" download="${name}">🎬 ${name}（${formatSize(file.size)}）</a>
           </div>`;
       }
-      if (kind === "audio" && file.url) {
+      if (kind === "audio" && file.dataUrl) {
         return `
           <div class="post-file">
-            <audio controls preload="metadata" src="${file.url}" style="width:100%;margin-bottom:4px;"></audio>
-            <a href="${file.url}" target="_blank" rel="noopener noreferrer" download="${name}">🎧 ${name}（${formatSize(file.size)}）</a>
+            <audio controls preload="metadata" src="${file.dataUrl}" style="width:100%;margin-bottom:4px;"></audio>
+            <a href="${file.dataUrl}" target="_blank" rel="noopener noreferrer" download="${name}">🎧 ${name}（${formatSize(file.size)}）</a>
           </div>`;
       }
       return "";
@@ -1680,7 +1676,6 @@
             if (!canManageBoard()) { alert('掲示板管理権限がありません。'); return; }
             if (!confirm('この投稿を削除しますか？')) return;
             try {
-              await deleteStorageFileIfAny(item.file);
               await remove(ref(db, `board/${key}`));
               showBanner('掲示板投稿を削除しました', false);
             } catch (err) {
@@ -3422,8 +3417,6 @@
         const toDelete = collectDescendants(postKey);
         toDelete.push(postKey);
         for (const key of toDelete) {
-          const target = allPostsCache.find(p => p.key === key);
-          if (target && target.file) await deleteStorageFileIfAny(target.file);
           await remove(ref(db, `threads/${threadKey}/posts/${key}`));
         }
         showBanner('レスを削除しました', false);
@@ -3450,12 +3443,6 @@
       if (!confirm('このスレッドをすべてのレスごと削除しますか？\nこの操作は取り消せません。')) return;
       const key = currentThreadKey;
       try {
-        const thread = allThreadsCache.find(t => t.key === key);
-        if (thread && thread.posts) {
-          for (const p of Object.values(thread.posts)) {
-            if (p && p.file) await deleteStorageFileIfAny(p.file);
-          }
-        }
         await remove(ref(db, `threads/${key}`));
         showBanner('スレッドを削除しました', false);
         showThreadList();
@@ -3597,44 +3584,6 @@
     window.addEventListener('unhandledrejection', (event) => {
       console.error('未処理のPromiseエラー:', event.reason);
     });
-
-    // ===== devtools検知（動作確認中はコメントアウト推奨） =====
-    // (() => {
-    //   'use strict';
-    //   const style = document.createElement('style');
-    //   style.textContent = `@media print { html, body { display:none !important; visibility:hidden !important; } }`;
-    //   document.head.appendChild(style);
-    //   window.addEventListener('contextmenu', (e) => { e.preventDefault(); }, true);
-    //   const disableDevShortcuts = (e) => {
-    //     const meta = e.metaKey, ctrl = e.ctrlKey, alt = e.altKey, shift = e.shiftKey;
-    //     const key = e.key.toLowerCase();
-    //     if (
-    //       e.key === 'F12' || e.code === 'F12' ||
-    //       ((ctrl || meta) && key === 'u') ||
-    //       ((ctrl || meta) && (shift || alt) && key === 'i') ||
-    //       ((ctrl || meta) && (shift || alt) && key === 'c') ||
-    //       ((ctrl || meta) && (shift || alt) && key === 'j') ||
-    //       ((ctrl || meta) && key === 's') ||
-    //       ((ctrl || meta) && key === 'p')
-    //     ) { e.preventDefault(); e.stopPropagation(); return false; }
-    //   };
-    //   window.addEventListener('keydown', disableDevShortcuts, true);
-    //   window.addEventListener('keyup', disableDevShortcuts, true);
-    //   window.addEventListener('keypress', disableDevShortcuts, true);
-    //   const redirectToBlank = () => { window.location.href = 'about:blank'; };
-    //   const threshold = 160;
-    //   window.addEventListener('resize', () => {
-    //     const isOpened = (window.outerWidth - window.innerWidth > threshold) ||
-    //                      (window.outerHeight - window.innerHeight > threshold);
-    //     if (isOpened) redirectToBlank();
-    //   }, true);
-    //   setInterval(() => {
-    //     const start = performance.now();
-    //     (function () {}.constructor('debugger')());
-    //     const end = performance.now();
-    //     if (end - start > 100) redirectToBlank();
-    //   }, 100);
-    // })();
   </script>
 </body>
 </html>
